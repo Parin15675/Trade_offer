@@ -6,6 +6,7 @@ from app.zodb_setup import get_root, commit_changes, close_connection
 from app.getUserID import check_session_cookie
 from fastapi.responses import JSONResponse
 from api.models.item_class import TradeItem
+from api.models.TradeOffers import Item, User, TradeOffer, Match  # SQLAlchemy models
 
 router = APIRouter(tags=["Items_management"])
 
@@ -130,3 +131,125 @@ async def get_all_posts(request: Request, db: Session = Depends(get_db)):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+    
+
+@router.get("/get-trade-offers")
+async def get_trade_offers(request: Request, db: Session = Depends(get_db)):
+    try:
+        # ตรวจสอบ session token
+        user_id = check_session_cookie(request)
+        
+        # ดึงข้อเสนอที่ส่งถึงผู้ใช้ปัจจุบัน และมีสถานะ "pending"
+        offers = db.query(TradeOffer).filter(
+            TradeOffer.receiver_id == user_id,
+            TradeOffer.status == "pending"
+        ).all()
+        
+        if not offers:
+            return []
+        
+        # ดึงข้อมูลเพิ่มเติมสำหรับแต่ละข้อเสนอ
+        root = get_root()
+        trade_items = root.get("trade_items", {})
+        
+        detailed_offers = []
+        for offer in offers:
+            # ดึงข้อมูลผู้ส่ง
+            sender = db.query(User).filter(User.ID == offer.sender_id).first()
+            
+            # ดึงข้อมูลรายการของผู้ส่ง
+            sender_item = db.query(Item).filter(Item.ID == offer.sender_item_id).first()
+            sender_zodb_item = trade_items.get(sender_item.zodb_id) if sender_item else None
+            
+            # ดึงข้อมูลรายการของผู้รับ
+            receiver_item = db.query(Item).filter(Item.ID == offer.receiver_item_id).first()
+            receiver_zodb_item = trade_items.get(receiver_item.zodb_id) if receiver_item else None
+            
+            # สร้างข้อมูลข้อเสนอที่มีรายละเอียดเพิ่มเติม
+            offer_data = {
+                "ID": offer.ID,
+                "status": offer.status,
+                "created_at": offer.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                
+                "sender_id": offer.sender_id,
+                "sender_username": sender.UserName if sender else "Unknown User",
+                
+                "sender_item_id": offer.sender_item_id,
+                "sender_item_zodb_id": sender_item.zodb_id if sender_item else None,
+                "sender_item_name": sender_zodb_item.name if sender_zodb_item else "Unknown Item",
+                "sender_item_description": sender_zodb_item.description if sender_zodb_item else "",
+                "sender_item_price": sender_zodb_item.price if sender_zodb_item else "",
+                "sender_item_image": sender_zodb_item.image if sender_zodb_item else "",
+                
+                "receiver_id": offer.receiver_id,
+                "receiver_item_id": offer.receiver_item_id,
+                "receiver_item_zodb_id": receiver_item.zodb_id if receiver_item else None,
+                "receiver_item_name": receiver_zodb_item.name if receiver_zodb_item else "Unknown Item",
+                "receiver_item_image": receiver_zodb_item.image if receiver_zodb_item else ""
+            }
+            
+            detailed_offers.append(offer_data)
+            
+        return detailed_offers
+        
+    except Exception as e:
+        return HTTPException(status_code=500, detail=f"Error fetching trade offers: {str(e)}")
+
+@router.put("/trade-offers/{offer_id}/accept")
+async def accept_offer(offer_id: int, request: Request, db: Session = Depends(get_db)):
+    try:
+        # ตรวจสอบ session token
+        user_id = check_session_cookie(request)
+        
+        # ตรวจสอบว่าข้อเสนอมีอยู่จริงและเป็นของผู้ใช้ปัจจุบัน
+        offer = db.query(TradeOffer).filter(
+            TradeOffer.ID == offer_id,
+            TradeOffer.receiver_id == user_id,
+            TradeOffer.status == "pending"
+        ).first()
+        
+        if not offer:
+            return HTTPException(status_code=404, detail="Offer not found or already processed")
+        
+        # อัปเดตสถานะข้อเสนอเป็น "accepted"
+        offer.status = "accepted"
+        db.commit()
+        db.refresh(offer)
+        
+        # สร้างรายการ match
+        match = Match(offer_id=offer.ID)
+        db.add(match)
+        db.commit()
+        db.refresh(match)
+        
+        return {"message": "Offer accepted successfully", "match_id": match.ID}
+        
+    except Exception as e:
+        db.rollback()
+        return HTTPException(status_code=500, detail=f"Error accepting offer: {str(e)}")
+
+@router.delete("/trade-offers/{offer_id}/reject")
+async def reject_offer(offer_id: int, request: Request, db: Session = Depends(get_db)):
+    try:
+        # ตรวจสอบ session token
+        user_id = check_session_cookie(request)
+        
+        # ตรวจสอบว่าข้อเสนอมีอยู่จริงและเป็นของผู้ใช้ปัจจุบัน
+        offer = db.query(TradeOffer).filter(
+            TradeOffer.ID == offer_id,
+            TradeOffer.receiver_id == user_id,
+            TradeOffer.status == "pending"
+        ).first()
+        
+        if not offer:
+            return HTTPException(status_code=404, detail="Offer not found or already processed")
+        
+        # อัปเดตสถานะข้อเสนอเป็น "rejected"
+        offer.status = "rejected"
+        db.commit()
+        
+        return {"message": "Offer rejected successfully"}
+        
+    except Exception as e:
+        db.rollback()
+        return HTTPException(status_code=500, detail=f"Error rejecting offer: {str(e)}")
